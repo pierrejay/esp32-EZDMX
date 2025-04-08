@@ -1,4 +1,4 @@
-# ESP32 `EZDMX` Library
+# ESP32 EZDMX Library
 
 ## Overview
 
@@ -6,7 +6,7 @@
 
 ## Operating Modes
 
-`EZDMX` supports the most basic functions for each of the DMX operating modes acting as a simple interface to set & read individual channel values (no support forRDM, scenes, etc.).
+`EZDMX` supports the most basic functions for each of the DMX operating modes acting as a simple interface to set & read individual channel values (no support for RDM, scenes, etc.).
 
 - **`MASTER` Mode**: The ESP32 functions as a DMX controller, sending DMX data for the 512 channels to connected fixtures. The library manages the DMX protocol timing requirements including proper break timing and frame structure.
 
@@ -67,7 +67,7 @@ Add lib directory (or just the `EZDMX.h` file) to your project
 
 ### Initialization
 
-Create an EZDMX instance using either the Arduino or ESP-IDF constructor:
+Create an `EZDMX` instance using either the Arduino or ESP-IDF constructor:
 
 ```cpp
 // Arduino environment
