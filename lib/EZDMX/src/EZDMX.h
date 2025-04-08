@@ -25,29 +25,29 @@ public:
 
     enum Status {
         SUCCESS = 0,           // Operation successful
-        ERR_UART,              // UART initialization or operation error
-        ERR_GPIO,              // GPIO configuration error (TX, RX, DE pins)
-        ERR_WRONG_MODE,        // Operation not allowed in current mode (MASTER/SLAVE)
-        ERR_CHANNEL_OVERFLOW,  // Channel number out of limits (>512 or <1)
-        ERR_NULL_INPUT,        // Null pointer provided as parameter
-        ERR_TASK_FAILED,       // Task creation/execution failed
-        ERR_NOT_RUNNING,       // Operation impossible because DMX is not started
-        ERR_FRAME_ERROR,       // DMX frame error (missing break, invalid start code...)
-        ERR_TIMEOUT,           // Timeout on DMX operation
+        UART_ERROR,              // UART initialization or operation error
+        GPIO_ERROR,              // GPIO configuration error (TX, RX, DE pins)
+        WRONG_MODE,        // Operation not allowed in current mode (MASTER/SLAVE)
+        CHANNEL_OVERFLOW,  // Channel number out of limits (>512 or <1)
+        NULL_INPUT,        // Null pointer provided as parameter
+        TASK_FAILED,       // Task creation/execution failed
+        NOT_RUNNING,       // Operation impossible because DMX is not started
+        FRAME_ERROR,       // DMX frame error (missing break, invalid start code...)
+        TIMEOUT,           // Timeout on DMX operation
     };
 
     static constexpr const char* toString(Status status) {
         switch (status) {
             case SUCCESS: return "success";
-            case ERR_UART: return "uart error";
-            case ERR_GPIO: return "gpio error";
-            case ERR_WRONG_MODE: return "wrong mode";
-            case ERR_CHANNEL_OVERFLOW: return "channel overflow";
-            case ERR_NULL_INPUT: return "null input";
-            case ERR_TASK_FAILED: return "task failed";
-            case ERR_NOT_RUNNING: return "not running";
-            case ERR_FRAME_ERROR: return "frame error";
-            case ERR_TIMEOUT: return "timeout";
+            case UART_ERROR: return "uart error";
+            case GPIO_ERROR: return "gpio error";
+            case WRONG_MODE: return "wrong mode";
+            case CHANNEL_OVERFLOW: return "channel overflow";
+            case NULL_INPUT: return "null input";
+            case TASK_FAILED: return "task failed";
+            case NOT_RUNNING: return "not running";
+            case FRAME_ERROR: return "frame error";
+            case TIMEOUT: return "timeout";
             default: return "unknown";
         }
     }
@@ -146,19 +146,19 @@ public:
         // Install the UART driver
         esp_err_t err = uart_driver_install(_uart_num, DMX_BUFFER_SIZE, DMX_BUFFER_SIZE, 0, NULL, ESP_INTR_FLAG_IRAM);
         if (err != ESP_OK) {
-            return Error(ERR_UART);
+            return Error(UART_ERROR);
         }
 
         err = uart_param_config(_uart_num, &uart_config);
         if (err != ESP_OK) {
             uart_driver_delete(_uart_num);
-            return Error(ERR_UART);
+            return Error(UART_ERROR);
         }
 
         err = uart_set_pin(_uart_num, _txPin, _rxPin, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
         if (err != ESP_OK) {
             uart_driver_delete(_uart_num);
-            return Error(ERR_GPIO);
+            return Error(GPIO_ERROR);
         }
 
         if (_mode == Mode::MASTER) {
@@ -174,13 +174,13 @@ public:
                 err = gpio_config(&io_conf);
                 if (err != ESP_OK) {
                     uart_driver_delete(_uart_num);
-                    return Error(ERR_GPIO);
+                    return Error(GPIO_ERROR);
                 }
                 
                 err = gpio_set_level((gpio_num_t)_dePin, 1);
                 if (err != ESP_OK) {
                     uart_driver_delete(_uart_num);
-                    return Error(ERR_GPIO);
+                    return Error(GPIO_ERROR);
                 }
             }
         } else {
@@ -212,7 +212,7 @@ public:
                         &_transmitTaskHandle);
             if (ret != pdPASS) {
                 _running = false;
-                return Error(ERR_TASK_FAILED);
+                return Error(TASK_FAILED);
             }
         } else if (_mode == Mode::SLAVE) {
             BaseType_t ret = xTaskCreate(ReceiveTask, 
@@ -223,7 +223,7 @@ public:
                         &_receiveTaskHandle);
             if (ret != pdPASS) {
                 _running = false;
-                return Error(ERR_TASK_FAILED);
+                return Error(TASK_FAILED);
             }
         }
         return Success();
@@ -235,7 +235,7 @@ public:
      */
     Result stop() {
         if (!_running) {
-            return Error(ERR_NOT_RUNNING);
+            return Error(NOT_RUNNING);
         }
 
         _running = false;
@@ -257,10 +257,10 @@ public:
      */
     Result set(uint16_t channel, uint8_t value) {
         if (_mode != Mode::MASTER) {
-            return Error(ERR_WRONG_MODE);
+            return Error(WRONG_MODE);
         }
         if (channel < 1 || channel > DMX_UNIVERSE_SIZE) {
-            return Error(ERR_CHANNEL_OVERFLOW);
+            return Error(CHANNEL_OVERFLOW);
         }
         
         // Update the value in the map
@@ -275,7 +275,7 @@ public:
      */
     Result set(const std::map<uint16_t, uint8_t>& channelValues) {
         if (_mode != Mode::MASTER) {
-            return Error(ERR_WRONG_MODE);
+            return Error(WRONG_MODE);
         }
         uint16_t nbChannelsWritten = 0;
         for (const auto& pair : channelValues) {
@@ -296,17 +296,17 @@ public:
      */
     Result set(uint8_t* values, uint16_t nbChannels, uint16_t startChannel = 1) {
         if (_mode != Mode::MASTER) {
-            return Error(ERR_WRONG_MODE);
+            return Error(WRONG_MODE);
         }
         if (values == nullptr) {
-            return Error(ERR_NULL_INPUT);
+            return Error(NULL_INPUT);
         }
         
         // Check & adjust startChannel
         if (startChannel < 1) {
             startChannel = 1;
         } else if (startChannel > DMX_UNIVERSE_SIZE) {
-            return Error(ERR_CHANNEL_OVERFLOW);
+            return Error(CHANNEL_OVERFLOW);
         }
         
         // Calculate the maximum number of channels possible from startChannel
@@ -327,14 +327,14 @@ public:
      */
     Result set(const std::vector<uint8_t>& values, uint16_t startChannel = 1) {
         if (_mode != Mode::MASTER) {
-            return Error(ERR_WRONG_MODE);
+            return Error(WRONG_MODE);
         }
         
         // Check & adjust startChannel
         if (startChannel < 1) {
             startChannel = 1;
         } else if (startChannel > DMX_UNIVERSE_SIZE) {
-            return Error(ERR_CHANNEL_OVERFLOW);
+            return Error(CHANNEL_OVERFLOW);
         }
         
         // Calculate the maximum number of channels possible from startChannel
@@ -360,7 +360,7 @@ public:
         if (channel < 1 || channel > DMX_UNIVERSE_SIZE) {
             value = 0;
             if (timestamp) *timestamp = 0;
-            return Error(ERR_CHANNEL_OVERFLOW);
+            return Error(CHANNEL_OVERFLOW);
         }
 
         if (_mode == Mode::MASTER) {
@@ -381,7 +381,7 @@ public:
      */
     Result getAllChannels(uint8_t* values, uint64_t* timestamp = nullptr) const {
         if (values == nullptr) {
-            return Error(ERR_NULL_INPUT);
+            return Error(NULL_INPUT);
         }
 
         if (_mode == Mode::MASTER) {
