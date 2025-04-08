@@ -21,17 +21,16 @@ static constexpr int DMX_RX = 23;
 static constexpr int DMX_DE = -1;  // Pin for RS485 transmitter, -1 if not used
 
 #if !IS_SLAVE_MODE
+  // Variables for MASTER mode
   static constexpr int BUTTON_PIN = 1;  // Pin for button only in MASTER mode
-#endif
-
-// Create a DMX instance using Serial1
-EZDMX dmx(IS_SLAVE_MODE ? EZDMX::Mode::SLAVE : EZDMX::Mode::MASTER, &Serial1, DMX_TX, DMX_RX, DMX_DE);
-
-#if IS_SLAVE_MODE
+#else
   // Variables for SLAVE mode
   static uint64_t lastDisplayTime = 0;
   static constexpr uint32_t DISPLAY_INTERVAL_MS = 1000;  // Display interval in SLAVE mode
 #endif
+
+// Create a DMX instance using Serial1
+EZDMX dmx(IS_SLAVE_MODE ? EZDMX::Mode::SLAVE : EZDMX::Mode::MASTER, &Serial1, DMX_TX, DMX_RX, DMX_DE);
 
 void setup() {
   Serial.begin(115200);
