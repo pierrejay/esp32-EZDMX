@@ -136,11 +136,7 @@ public:
             .stop_bits = UART_STOP_BITS_2,     // 2 stop bits
             .flow_ctrl = UART_HW_FLOWCTRL_DISABLE, // No flow control
             .rx_flow_ctrl_thresh = 0,          // Not used
-            #if CONFIG_IDF_TARGET_ESP32S3 == 1
-                .source_clk = UART_SCLK_APB,       // Source clock (for ESP32S3)
-            #else
-                .source_clk = UART_SCLK_DEFAULT,       // Source clock (for ESP32C6)
-            #endif
+            .source_clk = UART_SCLK_DEFAULT,       // Source clock (for ESP32C6)
         };
 
         // Install the UART driver
@@ -524,7 +520,7 @@ private:
         #elif CONFIG_IDF_TARGET_ESP32 == 1
             else if (serial == &Serial2) return UART_NUM_2;
         #endif
-        
+
         return UART_NUM_MAX;
     }
 #endif
