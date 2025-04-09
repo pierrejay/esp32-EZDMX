@@ -171,11 +171,11 @@ if (result != EZDMX::SUCCESS) {
 
 ## Examples
 
-- **basic-button.cpp** file (Arduino Core): 
+- **`basic-button.cpp`** file (Arduino Core): 
   - Simple DMX controller acting as `MASTER` or `SLAVE` (selected with build flag)
   - Displays read/write values of the first 8 channels to USB serial
   - Master changes values of channels from 1 to 8 when the button is pressed
-- **master-http.cpp** file (Arduino Core): simple HTTP-DMX Master bridge based on `ESPAsyncWebServer` library
+- **`master-http.cpp`** file (Arduino Core): simple HTTP-DMX Master bridge based on `ESPAsyncWebServer` library
   - Get channel values with GET request
   - Set channel values with POST request & JSON body
   - Reset channels & start/stop transmission with POST request
