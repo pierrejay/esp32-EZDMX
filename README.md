@@ -116,18 +116,20 @@ result = dmx.stop();
 dmx.set(1, 255);  // Set channel 1 to full brightness
 
 // Set multiple channels with a map
-std::map<uint16_t, uint8_t> channelValues = {
-  {1, 255}, {2, 128}, {3, 64}
+std::map<uint16_t, uint8_t> mapValues = {
+  {1, 255}, 
+  {2, 128}, 
+  {3, 64}
 };
-dmx.set(channelValues);
+dmx.set(mapValues);
 
 // Set multiple channels with an array
-uint8_t values[] = {255, 128, 64};
-dmx.set(values, 3, 1);  // Set 3 channels starting at channel 1
+uint8_t arrValues[] = {255, 128, 64};
+dmx.set(arrValues, sizeof(arrValues)/sizeof(arrValues[0]), 1);  // Set 3 channels starting at channel 1 (default)
 
 // Set multiple channels with a vector
 std::vector<uint8_t> vecValues = {255, 128, 64};
-dmx.set(vecValues, 1);  // Set values starting at channel 1
+dmx.set(vecValues, 6);  // Set values starting at channel 6 (default: 1)
 ```
 
 ### Reading Channel Values
@@ -170,7 +172,14 @@ if (result != EZDMX::SUCCESS) {
 
 ## Examples
 
-See the **main.cpp** file (Arduino Core): simple DMX controller acting as `MASTER` or `SLAVE` (selected with build flag), displays read/write values of the first 8 channels to USB serial.
+- **basic-button.cpp** file (Arduino Core): 
+  - Simple DMX controller acting as `MASTER` or `SLAVE` (selected with build flag)
+  - Displays read/write values of the first 8 channels to USB serial
+  - Master changes values of channels from 1 to 8 when the button is pressed
+- **master-http.cpp** file (Arduino Core): simple HTTP-DMX Master bridge based on `ESPAsyncWebServer` library
+  - Get channel values with GET request
+  - Set channel values with POST request & JSON body
+  - Reset channels & start/stop transmission with POST request
 
 
 ## API Reference
