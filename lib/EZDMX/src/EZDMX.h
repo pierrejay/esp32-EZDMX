@@ -517,9 +517,14 @@ private:
     static uart_port_t serialToUartPort(Stream* serial) {
         if (serial == &Serial) return UART_NUM_0;
         else if (serial == &Serial1) return UART_NUM_1;
+
+        // Enable Serial2 for ESP32 & ESP32S3
         #if CONFIG_IDF_TARGET_ESP32S3 == 1
             else if (serial == &Serial2) return UART_NUM_2;
+        #elif CONFIG_IDF_TARGET_ESP32 == 1
+            else if (serial == &Serial2) return UART_NUM_2;
         #endif
+        
         return UART_NUM_MAX;
     }
 #endif
