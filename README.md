@@ -70,6 +70,8 @@ Add lib directory (or just the `EZDMX.h` file) to your project
 Create an `EZDMX` instance using either the Arduino or ESP-IDF constructor:
 
 ```cpp
+The "Arduino API" (actually only the constructor to take a `Serial` object) will be automatically enabled if the `ARDUINO` macro is defined.
+
 // Arduino environment
 EZDMX dmx(EZDMX::MASTER,  // DMX mode
           &Serial1,       // UART Serial port
@@ -81,7 +83,6 @@ EZDMX dmx(EZDMX::MASTER,  // DMX mode
 EZDMX dmx(EZDMX::SLAVE, &Serial1, 16, 23, -1);
 
 // ESP-IDF native environment
-#else
 EZDMX dmx(EZDMX::MASTER,  // DMX mode
           UART_NUM_1,     // UART port number
           16,             // UART TX pin
@@ -90,7 +91,6 @@ EZDMX dmx(EZDMX::MASTER,  // DMX mode
 
 // Or for Slave mode
 EZDMX dmx(EZDMX::SLAVE, UART_NUM_1, 16, 23, -1);
-#endif
 ```
 
 ### Starting and Stopping DMX
