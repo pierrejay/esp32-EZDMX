@@ -7,6 +7,7 @@
 #include <ArduinoJson.h>
 #include <AsyncJson.h>
 #include <EZDMX.h>
+#include <AsyncWebSocket.h>
 
 // DMX UART pins
 static constexpr int DMX_TX = 43;
@@ -23,9 +24,12 @@ static constexpr int ETH_RST = 9;
 W5500Driver driver(ETH_CS, ETH_INT, ETH_RST);
 
 AsyncWebServer server(80);
+AsyncWebSocket ws("/dmx/stream");
 
 // Create a DMX instance using Serial1
 EZDMX dmx(EZDMX::Mode::MASTER, &Serial1, DMX_TX, DMX_RX, DMX_DE);
+
+static constexpr bool DEBUG_WS = false;  // Flag pour activer/désactiver les logs WebSocket
 
 void setupNetwork() {
   Serial.println("[setupNetwork] Configuring Ethernet...");
@@ -47,6 +51,99 @@ void setupNetwork() {
   }
 }
 
+// WebSocket API handler
+void onWsEvent(AsyncWebSocket * server, AsyncWebSocketClient * client, AwsEventType type, void * arg, uint8_t *data, size_t len) {
+    if (type == WS_EVT_CONNECT) {
+        if (DEBUG_WS) {
+            Serial.printf("[WebSocket] Client #%u connected from %s\n", client->id(), client->remoteIP().toString().c_str());
+        }
+    } else if (type == WS_EVT_DISCONNECT) {
+        if (DEBUG_WS) {
+            Serial.printf("[WebSocket] Client #%u disconnected\n", client->id());
+        }
+    } else if (type == WS_EVT_DATA) {
+        if (DEBUG_WS) {
+            // Log des données reçues
+            Serial.printf("[WebSocket] Received data (%d bytes): ", len);
+            Serial.write(data, std::min(len, (size_t)50));
+            Serial.println();
+
+            // Vérifier l'état actuel des canaux
+            uint8_t currentValues[EZDMX::DMX_UNIVERSE_SIZE];
+            auto getResult = dmx.getAllChannels(currentValues);
+            Serial.printf("[WebSocket] Current channel 1 value: %d\n", currentValues[0]);
+        }
+
+        // Vérifier que DMX est actif
+        if (!dmx.isRunning()) {
+            if (DEBUG_WS) {
+                Serial.println("[WebSocket] DMX not running, starting...");
+            }
+            dmx.start();
+        }
+
+        if (DEBUG_WS) {
+            Serial.printf("[WebSocket] DMX running status: %d\n", dmx.isRunning());
+        }
+
+        StaticJsonDocument<2048> doc;
+        DeserializationError error = deserializeJson(doc, (const char*)data, len);
+
+        if (error) {
+            if (DEBUG_WS) {
+                Serial.printf("[WebSocket] Error parsing JSON: %s\n", error.c_str());
+            }
+            return;
+        }
+
+        if (doc.is<JsonArray>()) {
+            JsonArray array = doc.as<JsonArray>();
+            int channel = 1;
+            
+            if (DEBUG_WS) {
+                Serial.println("[WebSocket] Processing array data");
+            }
+            
+            // Fast update of channels
+            for (JsonVariant value : array) {
+                if (channel <= EZDMX::DMX_UNIVERSE_SIZE) {
+                    uint8_t dmxValue = value.as<uint8_t>();
+                    auto result = dmx.set(channel, dmxValue);
+                    
+                    if (DEBUG_WS) {
+                        Serial.printf("[WebSocket] Setting channel %d to value %d: %s\n", 
+                            channel, dmxValue, EZDMX::toString(result.status));
+                        
+                        // Vérifier que la valeur a bien été mise à jour
+                        uint8_t checkValue;
+                        dmx.get(channel, checkValue);
+                        Serial.printf("[WebSocket] Channel %d value after set: %d\n", 
+                            channel, checkValue);
+                    }
+                    
+                    channel++;
+                }
+            }
+            
+            if (DEBUG_WS) {
+                Serial.printf("[WebSocket] Updated %d channels\n", channel - 1);
+            }
+        } else if (doc.containsKey("clear")) {
+            if (DEBUG_WS) {
+                Serial.println("[WebSocket] Clear command received");
+            }
+            auto result = dmx.resetAllChannels();
+            if (DEBUG_WS) {
+                Serial.printf("[WebSocket] Clear result: %s\n", EZDMX::toString(result.status));
+            }
+        } else {
+            if (DEBUG_WS) {
+                Serial.println("[WebSocket] Received data is not an array or clear command");
+            }
+        }
+    }
+    vTaskDelay(pdMS_TO_TICKS(10));
+}
 
 // HTTP API :
 //
@@ -63,6 +160,10 @@ void setupNetwork() {
 // - POST /dmx/set {clear: true}: clear all channels
 
 void setupWebServer() {
+    // Add WebSocket handler
+    ws.onEvent(onWsEvent);
+    server.addHandler(&ws);
+
     server.on("/dmx", HTTP_GET, [](AsyncWebServerRequest *request){
       Serial.printf("[HTTP] GET /dmx from %s\n", request->client()->remoteIP().toString().c_str());
       

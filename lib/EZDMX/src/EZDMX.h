@@ -284,6 +284,25 @@ public:
     }
 
     /**
+     * @brief Set multiple DMX channels at once (MASTER mode only)
+     * @param channelValues Map of channel/value pairs
+     * @return Result indicating success or failure and number of channels written
+     */
+    Result set(const std::unordered_map<uint16_t, uint8_t>& channelValues) {
+        if (_mode != Mode::MASTER) {
+            return Error(WRONG_MODE);
+        }
+        uint16_t nbChannelsWritten = 0;
+        for (const auto& pair : channelValues) {
+            if (pair.first >= 1 && pair.first <= DMX_UNIVERSE_SIZE) {
+                _channels[pair.first] = pair.second;
+                nbChannelsWritten++;
+            }
+        }
+        return Success(nbChannelsWritten);
+    }
+
+    /**
      * @brief Set multiple DMX channels from an array (MASTER mode only)
      * @param values Pointer to array of values
      * @param nbChannels Number of channels to set (max 512)
