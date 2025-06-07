@@ -1,4 +1,3 @@
-(fade-ws.venv) pierre@MacBookPro esp-dmx-scripts-test % cat fade.sh
 #!/bin/bash
 
 # Configuration

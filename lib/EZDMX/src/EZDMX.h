@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <map>
 #include <vector>
+#include <unordered_map>
 #include <driver/uart.h>
 #include <soc/uart_struct.h>
 #include <driver/gpio.h>
@@ -15,6 +16,7 @@
 #include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <freertos/timers.h>
 
 class EZDMX {
 public:
@@ -88,7 +90,8 @@ public:
         _running(false),
         _transmitTaskHandle(nullptr),
         _receiveTaskHandle(nullptr),
-        _lastFrameTimestamp(0)
+        _lastFrameTimestamp(0),
+        _dmxTimer(nullptr)
     {
         // Initialize channels to 0
         resetAllChannels();
@@ -112,7 +115,8 @@ public:
         _running(false),
         _transmitTaskHandle(nullptr),
         _receiveTaskHandle(nullptr),
-        _lastFrameTimestamp(0)
+        _lastFrameTimestamp(0),
+        _dmxTimer(nullptr)
     {
         // Initialize channels to 0
         resetAllChannels();
@@ -200,6 +204,7 @@ public:
 
         _running = true;
         if (_mode == Mode::MASTER) {
+            // Create the transmission task
             BaseType_t ret = xTaskCreate(TransmitTask, 
                         "dmx_tx", 
                         8192, 
@@ -210,6 +215,31 @@ public:
                 _running = false;
                 return Error(TASK_FAILED);
             }
+            
+            // Create the FreeRTOS timer for precise DMX timing
+            _dmxTimer = xTimerCreate("dmx_timer",
+                                   pdMS_TO_TICKS(DMX_MTBF_MS),
+                                   pdFALSE, // One-shot timer (not auto-reload)
+                                   this,   // Timer ID (pointer to this instance)
+                                   TimerCallback);
+            
+            if (_dmxTimer == nullptr) {
+                _running = false;
+                vTaskDelete(_transmitTaskHandle);
+                _transmitTaskHandle = nullptr;
+                return Error(TASK_FAILED);
+            }
+            
+            // Start the timer
+            if (xTimerStart(_dmxTimer, pdMS_TO_TICKS(100)) != pdPASS) {
+                _running = false;
+                xTimerDelete(_dmxTimer, pdMS_TO_TICKS(100));
+                _dmxTimer = nullptr;
+                vTaskDelete(_transmitTaskHandle);
+                _transmitTaskHandle = nullptr;
+                return Error(TASK_FAILED);
+            }
+            
         } else if (_mode == Mode::SLAVE) {
             BaseType_t ret = xTaskCreate(ReceiveTask, 
                         "dmx_rx", 
@@ -235,12 +265,26 @@ public:
         }
 
         _running = false;
-        vTaskDelay(pdMS_TO_TICKS(50));
         
         if (_mode == Mode::MASTER) {
-            _transmitTaskHandle = nullptr;
+            // Stop and delete the timer
+            if (_dmxTimer != nullptr) {
+                xTimerStop(_dmxTimer, pdMS_TO_TICKS(100));
+                xTimerDelete(_dmxTimer, pdMS_TO_TICKS(100));
+                _dmxTimer = nullptr;
+            }
+            
+            // Notify the task to wake up and exit cleanly
+            if (_transmitTaskHandle != nullptr) {
+                xTaskNotifyGive(_transmitTaskHandle);
+                vTaskDelay(pdMS_TO_TICKS(50));
+                _transmitTaskHandle = nullptr;
+            }
         } else {
-            _receiveTaskHandle = nullptr;
+            if (_receiveTaskHandle != nullptr) {
+                vTaskDelay(pdMS_TO_TICKS(50));
+                _receiveTaskHandle = nullptr;
+            }
         }
         return Success();
     }
@@ -443,6 +487,9 @@ private:
     TaskHandle_t _receiveTaskHandle;
     portMUX_TYPE _dmxMux = portMUX_INITIALIZER_UNLOCKED;
 
+    // FreeRTOS timer for DMX transmission timing
+    TimerHandle_t _dmxTimer;
+
     // Storage of DMX payload (0 = start code, 1..512 = channels)
     uint8_t _channels[DMX_UNIVERSE_SIZE + 1] = {0};
 
@@ -451,12 +498,32 @@ private:
     uint64_t _lastFrameTimestamp;
 
     /**
+     * @brief Timer callback for DMX transmission timing
+     */
+    static void TimerCallback(TimerHandle_t xTimer) {
+        EZDMX* dmx = static_cast<EZDMX*>(pvTimerGetTimerID(xTimer));
+        if (dmx && dmx->_transmitTaskHandle) {
+            // Notify the transmission task to send next frame
+            xTaskNotifyGive(dmx->_transmitTaskHandle);
+        }
+    }
+
+    /**
      * @brief DMX transmission task
      */
     static void TransmitTask(void* pEZDMX) {
         EZDMX* dmx = static_cast<EZDMX*>(pEZDMX);
         
+        // Send first frame immediately
+        bool firstFrame = true;
+        
         while (dmx->_running) {
+            if (!dmx->_running) break;
+            if (!firstFrame) {
+                // Wait for timer notification (except for first frame)
+                ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+            }
+            firstFrame = false;
 
             // Enter critical section for break and MAB
             portENTER_CRITICAL(&dmx->_dmxMux);
@@ -475,11 +542,13 @@ private:
             // 3. Send the DMX packet
             uart_write_bytes(dmx->_uart_num, (const char*)dmx->_channels, DMX_UNIVERSE_SIZE + 1);
             
-            // 4. Wait for all data to be sent (non blocking since it's done in a dedicated task)
+            // 4. Wait for all data to be sent
             uart_wait_tx_done(dmx->_uart_num, pdMS_TO_TICKS(100));
             
-            // 5. Wait for the frame interval
-            vTaskDelay(pdMS_TO_TICKS(DMX_MTBF_MS));
+            // 5. Start timer for MTBF (Mark Time Between Frames)
+            if (dmx->_running && dmx->_dmxTimer) {
+                xTimerStart(dmx->_dmxTimer, 0);
+            }
         }
         vTaskDelete(NULL);
     }
