@@ -80,8 +80,9 @@ public:
      * @param txPin DMX transmission pin
      * @param rxPin DMX reception pin (not used in master mode but required for configuration)
      * @param dePin Pin to activate RS485 transmitter (optional, -1 if not used)
+     * @param enablePerfLog Enable performance logging (optional, false if not used)
      */
-    EZDMX(Mode mode = Mode::MASTER, Stream* serial = &Serial1, int txPin = 17, int rxPin = 16, int dePin = -1) :
+    EZDMX(Mode mode = Mode::MASTER, Stream* serial = &Serial1, int txPin = 17, int rxPin = 16, int dePin = -1, bool enablePerfLog = false) :
         _mode(mode),
         _uart_num(serialToUartPort(serial)),
         _txPin(txPin),
@@ -91,7 +92,10 @@ public:
         _transmitTaskHandle(nullptr),
         _receiveTaskHandle(nullptr),
         _lastFrameTimestamp(0),
-        _dmxTimer(nullptr)
+        _dmxTimer(nullptr),
+        _timerStartTime(0),
+        _frameCounter(0),
+        _enablePerfLog(enablePerfLog)
     {
         // Initialize channels to 0
         resetAllChannels();
@@ -105,8 +109,9 @@ public:
      * @param txPin DMX transmission pin
      * @param rxPin DMX reception pin (not used in master mode but required for configuration)
      * @param dePin Pin to activate RS485 transmitter (optional, -1 if not used)
+     * @param enablePerfLog Enable performance logging
      */
-    EZDMX(Mode mode = Mode::MASTER, uart_port_t uart_num = UART_NUM_1, int txPin = 17, int rxPin = 16, int dePin = -1) :
+    EZDMX(Mode mode = Mode::MASTER, uart_port_t uart_num = UART_NUM_1, int txPin = 17, int rxPin = 16, int dePin = -1, bool enablePerfLog = false) :
         _mode(mode),
         _uart_num(uart_num),
         _txPin(txPin),
@@ -116,7 +121,10 @@ public:
         _transmitTaskHandle(nullptr),
         _receiveTaskHandle(nullptr),
         _lastFrameTimestamp(0),
-        _dmxTimer(nullptr)
+        _dmxTimer(nullptr),
+        _timerStartTime(0),
+        _frameCounter(0),
+        _enablePerfLog(enablePerfLog)
     {
         // Initialize channels to 0
         resetAllChannels();
@@ -216,25 +224,15 @@ public:
                 return Error(TASK_FAILED);
             }
             
-            // Create the FreeRTOS timer for precise DMX timing
-            _dmxTimer = xTimerCreate("dmx_timer",
-                                   pdMS_TO_TICKS(DMX_MTBF_MS),
-                                   pdFALSE, // One-shot timer (not auto-reload)
-                                   this,   // Timer ID (pointer to this instance)
-                                   TimerCallback);
-            
-            if (_dmxTimer == nullptr) {
+            // Create the esp_timer for precise DMX timing (one-shot)
+            esp_timer_create_args_t timer_args = {
+                .callback = TimerCallback,
+                .arg = this,
+                .name = "dmx_timer"
+            };
+            esp_err_t errTimer = esp_timer_create(&timer_args, &_dmxTimer);
+            if (errTimer != ESP_OK || _dmxTimer == nullptr) {
                 _running = false;
-                vTaskDelete(_transmitTaskHandle);
-                _transmitTaskHandle = nullptr;
-                return Error(TASK_FAILED);
-            }
-            
-            // Start the timer
-            if (xTimerStart(_dmxTimer, pdMS_TO_TICKS(100)) != pdPASS) {
-                _running = false;
-                xTimerDelete(_dmxTimer, pdMS_TO_TICKS(100));
-                _dmxTimer = nullptr;
                 vTaskDelete(_transmitTaskHandle);
                 _transmitTaskHandle = nullptr;
                 return Error(TASK_FAILED);
@@ -269,8 +267,8 @@ public:
         if (_mode == Mode::MASTER) {
             // Stop and delete the timer
             if (_dmxTimer != nullptr) {
-                xTimerStop(_dmxTimer, pdMS_TO_TICKS(100));
-                xTimerDelete(_dmxTimer, pdMS_TO_TICKS(100));
+                esp_timer_stop(_dmxTimer);
+                esp_timer_delete(_dmxTimer);
                 _dmxTimer = nullptr;
             }
             
@@ -487,8 +485,13 @@ private:
     TaskHandle_t _receiveTaskHandle;
     portMUX_TYPE _dmxMux = portMUX_INITIALIZER_UNLOCKED;
 
-    // FreeRTOS timer for DMX transmission timing
-    TimerHandle_t _dmxTimer;
+    // esp_timer one-shot timer for DMX transmission timing
+    esp_timer_handle_t _dmxTimer;
+
+    // Performance measurement variables for timer precision
+    uint64_t _timerStartTime;
+    uint32_t _frameCounter;
+    bool _enablePerfLog;
 
     // Storage of DMX payload (0 = start code, 1..512 = channels)
     uint8_t _channels[DMX_UNIVERSE_SIZE + 1] = {0};
@@ -500,9 +503,29 @@ private:
     /**
      * @brief Timer callback for DMX transmission timing
      */
-    static void TimerCallback(TimerHandle_t xTimer) {
-        EZDMX* dmx = static_cast<EZDMX*>(pvTimerGetTimerID(xTimer));
+    static void TimerCallback(void* arg) {
+        EZDMX* dmx = static_cast<EZDMX*>(arg);
         if (dmx && dmx->_transmitTaskHandle) {
+            // Measure timer precision
+            uint64_t currentTime = esp_timer_get_time();
+            if (dmx->_timerStartTime > 0) {
+                uint64_t actualInterval = currentTime - dmx->_timerStartTime;
+                uint64_t expectedInterval = DMX_MTBF_MS * 1000; // Convert to microseconds
+                int64_t jitter = actualInterval - expectedInterval;
+                
+                dmx->_frameCounter++;
+                // Print performance measurement every 100 frames to avoid spam
+                if (dmx->_frameCounter % 100 == 0 && dmx->_enablePerfLog) {
+                    #ifdef ARDUINO
+                        Serial.printf("DMX Timer Performance - Frame %u: Expected=%lluus, Actual=%lluus, Jitter=%lldus\n", 
+                                    dmx->_frameCounter, expectedInterval, actualInterval, jitter);
+                    #else
+                        printf("DMX Timer Performance - Frame %u: Expected=%lluus, Actual=%lluus, Jitter=%lldus\n", 
+                               dmx->_frameCounter, expectedInterval, actualInterval, jitter);
+                    #endif
+                }
+            }
+            
             // Notify the transmission task to send next frame
             xTaskNotifyGive(dmx->_transmitTaskHandle);
         }
@@ -547,7 +570,9 @@ private:
             
             // 5. Start timer for MTBF (Mark Time Between Frames)
             if (dmx->_running && dmx->_dmxTimer) {
-                xTimerStart(dmx->_dmxTimer, 0);
+                // Record timer start time for performance measurement
+                dmx->_timerStartTime = esp_timer_get_time();
+                esp_timer_start_once(dmx->_dmxTimer, DMX_MTBF_MS * 1000);
             }
         }
         vTaskDelete(NULL);
