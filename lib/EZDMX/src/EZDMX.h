@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <map>
 #include <vector>
+#include <unordered_map>
 #include <driver/uart.h>
 #include <soc/uart_struct.h>
 #include <driver/gpio.h>
@@ -15,6 +16,7 @@
 #include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <freertos/timers.h>
 
 class EZDMX {
 public:
@@ -78,8 +80,9 @@ public:
      * @param txPin DMX transmission pin
      * @param rxPin DMX reception pin (not used in master mode but required for configuration)
      * @param dePin Pin to activate RS485 transmitter (optional, -1 if not used)
+     * @param enablePerfLog Enable performance logging
      */
-    EZDMX(Mode mode = Mode::MASTER, Stream* serial = &Serial1, int txPin = 17, int rxPin = 16, int dePin = -1) :
+    EZDMX(Mode mode = Mode::MASTER, Stream* serial = &Serial1, int txPin = 17, int rxPin = 16, int dePin = -1, bool enablePerfLog = false) :
         _mode(mode),
         _uart_num(serialToUartPort(serial)),
         _txPin(txPin),
@@ -88,7 +91,14 @@ public:
         _running(false),
         _transmitTaskHandle(nullptr),
         _receiveTaskHandle(nullptr),
-        _lastFrameTimestamp(0)
+        _lastFrameTimestamp(0),
+        _dmxTimer(nullptr),
+        _timerStartTime(0),
+        _frameCounter(0),
+        _enablePerfLog(enablePerfLog),
+        _frameIntervalsIndex(0),
+        _frameIntervalsCount(0),
+        _prevFrameSendTime(0)
     {
         // Initialize channels to 0
         resetAllChannels();
@@ -102,8 +112,9 @@ public:
      * @param txPin DMX transmission pin
      * @param rxPin DMX reception pin (not used in master mode but required for configuration)
      * @param dePin Pin to activate RS485 transmitter (optional, -1 if not used)
+     * @param enablePerfLog Enable performance logging
      */
-    EZDMX(Mode mode = Mode::MASTER, uart_port_t uart_num = UART_NUM_1, int txPin = 17, int rxPin = 16, int dePin = -1) :
+    EZDMX(Mode mode = Mode::MASTER, uart_port_t uart_num = UART_NUM_1, int txPin = 17, int rxPin = 16, int dePin = -1, bool enablePerfLog = false) :
         _mode(mode),
         _uart_num(uart_num),
         _txPin(txPin),
@@ -112,7 +123,14 @@ public:
         _running(false),
         _transmitTaskHandle(nullptr),
         _receiveTaskHandle(nullptr),
-        _lastFrameTimestamp(0)
+        _lastFrameTimestamp(0),
+        _dmxTimer(nullptr),
+        _timerStartTime(0),
+        _frameCounter(0),
+        _enablePerfLog(enablePerfLog),
+        _frameIntervalsIndex(0),
+        _frameIntervalsCount(0),
+        _prevFrameSendTime(0)
     {
         // Initialize channels to 0
         resetAllChannels();
@@ -200,6 +218,7 @@ public:
 
         _running = true;
         if (_mode == Mode::MASTER) {
+            // Create the transmission task
             BaseType_t ret = xTaskCreate(TransmitTask, 
                         "dmx_tx", 
                         8192, 
@@ -210,6 +229,21 @@ public:
                 _running = false;
                 return Error(TASK_FAILED);
             }
+            
+            // Create the esp_timer for precise DMX timing (one-shot)
+            esp_timer_create_args_t timer_args = {
+                .callback = TimerCallback,
+                .arg = this,
+                .name = "dmx_timer"
+            };
+            esp_err_t errTimer = esp_timer_create(&timer_args, &_dmxTimer);
+            if (errTimer != ESP_OK || _dmxTimer == nullptr) {
+                _running = false;
+                vTaskDelete(_transmitTaskHandle);
+                _transmitTaskHandle = nullptr;
+                return Error(TASK_FAILED);
+            }
+            
         } else if (_mode == Mode::SLAVE) {
             BaseType_t ret = xTaskCreate(ReceiveTask, 
                         "dmx_rx", 
@@ -235,12 +269,26 @@ public:
         }
 
         _running = false;
-        vTaskDelay(pdMS_TO_TICKS(50));
         
         if (_mode == Mode::MASTER) {
-            _transmitTaskHandle = nullptr;
+            // Stop and delete the timer
+            if (_dmxTimer != nullptr) {
+                esp_timer_stop(_dmxTimer);
+                esp_timer_delete(_dmxTimer);
+                _dmxTimer = nullptr;
+            }
+            
+            // Notify the task to wake up and exit cleanly
+            if (_transmitTaskHandle != nullptr) {
+                xTaskNotifyGive(_transmitTaskHandle);
+                vTaskDelay(pdMS_TO_TICKS(50));
+                _transmitTaskHandle = nullptr;
+            }
         } else {
-            _receiveTaskHandle = nullptr;
+            if (_receiveTaskHandle != nullptr) {
+                vTaskDelay(pdMS_TO_TICKS(50));
+                _receiveTaskHandle = nullptr;
+            }
         }
         return Success();
     }
@@ -270,6 +318,25 @@ public:
      * @return Result indicating success or failure and number of channels written
      */
     Result set(const std::map<uint16_t, uint8_t>& channelValues) {
+        if (_mode != Mode::MASTER) {
+            return Error(WRONG_MODE);
+        }
+        uint16_t nbChannelsWritten = 0;
+        for (const auto& pair : channelValues) {
+            if (pair.first >= 1 && pair.first <= DMX_UNIVERSE_SIZE) {
+                _channels[pair.first] = pair.second;
+                nbChannelsWritten++;
+            }
+        }
+        return Success(nbChannelsWritten);
+    }
+
+    /**
+     * @brief Set multiple DMX channels at once (MASTER mode only)
+     * @param channelValues Map of channel/value pairs
+     * @return Result indicating success or failure and number of channels written
+     */
+    Result set(const std::unordered_map<uint16_t, uint8_t>& channelValues) {
         if (_mode != Mode::MASTER) {
             return Error(WRONG_MODE);
         }
@@ -314,6 +381,8 @@ public:
         // Copy the values into the channels starting from startChannel
         // We shift by 1 in _channels because index 0 is reserved for the start code
         memcpy(&_channels[startChannel], values, nbChannels);
+
+        return Success(nbChannels);
     }
 
     /**
@@ -397,6 +466,8 @@ public:
     Result resetAllChannels() {
         // Reset all values to zero
         memset(_channels, 0, DMX_UNIVERSE_SIZE + 1);
+        // Also clear slave buffer so that values are predictable before first frame is received
+        memset(_slaveValues, 0, DMX_UNIVERSE_SIZE);
         return Success();
     }
 
@@ -424,6 +495,21 @@ private:
     TaskHandle_t _receiveTaskHandle;
     portMUX_TYPE _dmxMux = portMUX_INITIALIZER_UNLOCKED;
 
+    // esp_timer one-shot timer for DMX transmission timing
+    esp_timer_handle_t _dmxTimer;
+
+    // Performance measurement variables for timer precision
+    uint64_t _timerStartTime;
+    uint32_t _frameCounter;
+    bool _enablePerfLog;
+
+    // Frame-to-frame performance measurement
+    static constexpr size_t FRAME_WINDOW = 20;
+    uint64_t _frameIntervals[FRAME_WINDOW] = {0};
+    size_t _frameIntervalsIndex;
+    size_t _frameIntervalsCount;
+    uint64_t _prevFrameSendTime;
+
     // Storage of DMX payload (0 = start code, 1..512 = channels)
     uint8_t _channels[DMX_UNIVERSE_SIZE + 1] = {0};
 
@@ -432,12 +518,51 @@ private:
     uint64_t _lastFrameTimestamp;
 
     /**
+     * @brief Timer callback for DMX transmission timing
+     */
+    static void TimerCallback(void* arg) {
+        EZDMX* dmx = static_cast<EZDMX*>(arg);
+        if (dmx && dmx->_transmitTaskHandle) {
+            // Measure timer precision
+            uint64_t currentTime = esp_timer_get_time();
+            if (dmx->_timerStartTime > 0) {
+                uint64_t actualInterval = currentTime - dmx->_timerStartTime;
+                uint64_t expectedInterval = DMX_MTBF_MS * 1000; // Convert to microseconds
+                int64_t jitter = actualInterval - expectedInterval;
+                
+                // Print performance measurement every 100 frames to avoid spam
+                if (dmx->_enablePerfLog && dmx->_frameCounter % 100 == 0) {
+                    #ifdef ARDUINO
+                        Serial.printf("DMX Timer Performance - Frame %u: Expected=%lluus, Actual=%lluus, Jitter=%lldus\n", 
+                                    dmx->_frameCounter, expectedInterval, actualInterval, jitter);
+                    #else
+                        printf("DMX Timer Performance - Frame %u: Expected=%lluus, Actual=%lluus, Jitter=%lldus\n", 
+                               dmx->_frameCounter, expectedInterval, actualInterval, jitter);
+                    #endif
+                }
+            }
+            
+            // Notify the transmission task to send next frame
+            xTaskNotifyGive(dmx->_transmitTaskHandle);
+        }
+    }
+
+    /**
      * @brief DMX transmission task
      */
     static void TransmitTask(void* pEZDMX) {
         EZDMX* dmx = static_cast<EZDMX*>(pEZDMX);
         
+        // Send first frame immediately
+        bool firstFrame = true;
+        
         while (dmx->_running) {
+            if (!dmx->_running) break;
+            if (!firstFrame) {
+                // Wait for timer notification (except for first frame)
+                ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+            }
+            firstFrame = false;
 
             // Enter critical section for break and MAB
             portENTER_CRITICAL(&dmx->_dmxMux);
@@ -456,11 +581,46 @@ private:
             // 3. Send the DMX packet
             uart_write_bytes(dmx->_uart_num, (const char*)dmx->_channels, DMX_UNIVERSE_SIZE + 1);
             
-            // 4. Wait for all data to be sent (non blocking since it's done in a dedicated task)
+            // 4. Wait for all data to be sent
             uart_wait_tx_done(dmx->_uart_num, pdMS_TO_TICKS(100));
             
-            // 5. Wait for the frame interval
-            vTaskDelay(pdMS_TO_TICKS(DMX_MTBF_MS));
+            // === Frame-to-frame performance measurement ===
+            uint64_t nowFrameTime = esp_timer_get_time();
+            if (dmx->_prevFrameSendTime != 0) {
+                uint64_t interval = nowFrameTime - dmx->_prevFrameSendTime; // µs
+
+                // Store interval in sliding window
+                dmx->_frameIntervals[dmx->_frameIntervalsIndex] = interval;
+                dmx->_frameIntervalsIndex = (dmx->_frameIntervalsIndex + 1) % FRAME_WINDOW;
+                if (dmx->_frameIntervalsCount < FRAME_WINDOW) dmx->_frameIntervalsCount++;
+
+                // Compute moving average when window filled enough
+                if (dmx->_enablePerfLog && dmx->_frameIntervalsCount == FRAME_WINDOW && dmx->_frameCounter % 100 == 0) {
+                    uint64_t sum = 0;
+                    for (size_t i = 0; i < FRAME_WINDOW; ++i) sum += dmx->_frameIntervals[i];
+                    uint64_t avgInterval = sum / FRAME_WINDOW;
+                    int64_t jitter = (int64_t)interval - (int64_t)avgInterval;
+
+                    #ifdef ARDUINO
+                        Serial.printf("DMX Frame Rate - Frame %u: Interval=%lluus, Avg=%lluus, Jitter=%lldus\n",
+                                        dmx->_frameCounter, interval, avgInterval, jitter);
+                    #else
+                        printf("DMX Frame Rate - Frame %u: Interval=%lluus, Avg=%lluus, Jitter=%lldus\n",
+                               dmx->_frameCounter, interval, avgInterval, jitter);
+                    #endif
+                }
+            }
+
+            dmx->_prevFrameSendTime = nowFrameTime;
+            // Incrément du compteur de frame
+            dmx->_frameCounter++;
+            
+            // 5. Start timer for MTBF (Mark Time Between Frames)
+            if (dmx->_running && dmx->_dmxTimer) {
+                // Record timer start time for performance measurement
+                dmx->_timerStartTime = esp_timer_get_time();
+                esp_timer_start_once(dmx->_dmxTimer, DMX_MTBF_MS * 1000);
+            }
         }
         vTaskDelete(NULL);
     }
