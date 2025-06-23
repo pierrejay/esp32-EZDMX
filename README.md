@@ -16,7 +16,7 @@
 ## Key Features
 
 - Simple API for DMX control and monitoring
-- Compliant with DMX512 timing specifications
+- Compliant with DMX512 timing specifications (UART API + esp_timer for MTBF)
 - Support for both `MASTER` (transmission) and `SLAVE` (reception) modes
 - Asynchronous operation using FreeRTOS tasks
 - Efficient error handling with Result system
@@ -154,6 +154,14 @@ dmx.getAllChannels(values, &timestamp);
 dmx.resetAllChannels();  // Set all channels to 0
 ```
 
+### Performance Logging
+
+Pass `true` to the last constructor parameter `enablePerfLog` (`false` by default) to print detailed performance information (timer precision, frame-to-frame jitter) every 100 frames. Logs are sent to `Serial` on Arduino or standard output on IDF, and can be useful for troubleshooting timing issues.
+
+```cpp
+EZDMX dmx(EZDMX::MASTER, &Serial1, 16, 23, -1, /*enablePerfLog*/ true);
+```
+
 ## Error Handling
 
 The library uses a `Result` type for error handling. It returns the status of the operation and the number of channels read/written (if applicable).
@@ -188,11 +196,11 @@ if (result != EZDMX::SUCCESS) {
 ```cpp
 // Arduino constructor
 #ifdef ARDUINO
-EZDMX(Mode mode = Mode::MASTER, Stream* serial = &Serial1, int txPin = 17, int rxPin = 16, int dePin = -1)
+EZDMX(Mode mode = Mode::MASTER, Stream* serial = &Serial1, int txPin = 17, int rxPin = 16, int dePin = -1, bool enablePerfLog = false)
 #endif
 
 // ESP-IDF constructor
-EZDMX(Mode mode = Mode::MASTER, uart_port_t uart_num = UART_NUM_1, int txPin = 17, int rxPin = 16, int dePin = -1)
+EZDMX(Mode mode = Mode::MASTER, uart_port_t uart_num = UART_NUM_1, int txPin = 17, int rxPin = 16, int dePin = -1, bool enablePerfLog = false)
 ```
 
 Parameters list:
@@ -203,6 +211,7 @@ Parameters list:
 - `txPin`: DMX transmission pin
 - `rxPin`: DMX reception pin
 - `dePin`: Pin to activate RS485 transmitter (optional, -1 if not used)
+- `enablePerfLog`: set to `true` to enable periodic performance logs on serial output (optional, default `false`)
 
 
 ### Main Methods
