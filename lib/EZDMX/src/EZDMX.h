@@ -11,10 +11,15 @@
 #include <unordered_map>
 #include <driver/uart.h>
 #include <soc/uart_struct.h>
+#include <soc/uart_periph.h>
+#include <hal/uart_ll.h>
 #include <driver/gpio.h>
+#include <esp_cpu.h>
 #include <esp_intr_alloc.h>
+#include <esp_rom_sys.h>
 #include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #include <freertos/task.h>
 #include <freertos/timers.h>
 
@@ -72,6 +77,36 @@ public:
     static constexpr uint32_t DMX_MAB_US = 24;      // Mark After Break (min 12µs)
     static constexpr uint32_t DMX_MTBF_MS = 10;     // Mark Time Between Frames (spec says 0-1000 ms)
 
+    /**
+     * @brief SLAVE reception counters, cumulative since start() or resetStats()
+     *
+     * Only `frames` were published to the channel values. A frame with a framing
+     * error or a FIFO overflow is dropped, so the last good values stay in place.
+     * Timing figures stay at zero unless enableLineTiming(true) was called.
+     */
+    struct SlaveStats {
+        uint32_t breaks;          // BREAK conditions detected
+        uint32_t frames;          // Good frames published (start code 0)
+        uint32_t shortFrames;     // Good frames with fewer than 512 slots (legal in DMX)
+        uint32_t errorFrames;     // Frames dropped: framing error or FIFO overflow inside them
+        uint32_t startCodeFrames; // Frames ignored: non-zero start code
+        uint32_t emptyFrames;     // BREAK followed by another BREAK with no data
+        uint32_t overlongFrames;  // Bytes received past slot 512 (extra bytes ignored)
+        uint32_t framingErrors;   // Framing errors not caused by a BREAK
+        uint32_t fifoOverflows;   // Hardware FIFO overflows
+        uint16_t lastSlots;       // Slot count of the last good frame
+        uint16_t minSlots;
+        uint16_t maxSlots;
+        uint32_t periodMinUs;     // BREAK-to-BREAK period, 0 until two breaks were seen
+        uint32_t periodAvgUs;
+        uint32_t periodMaxUs;
+        uint32_t timingSamples;   // Frames measured by the line timing probe
+        uint32_t timingMissed;    // Frames whose BREAK falling edge the probe did not catch
+        float breakMinUs, breakAvgUs, breakMaxUs;
+        float mabMinUs, mabAvgUs, mabMaxUs;
+        float startLowMinUs, startLowAvgUs, startLowMaxUs; // Low time of a 0x00 start code: 36 us at 250 kbaud
+    };
+
 #ifdef ARDUINO
     /**
      * @brief Constructor
@@ -90,7 +125,6 @@ public:
         _dePin(dePin),
         _running(false),
         _transmitTaskHandle(nullptr),
-        _receiveTaskHandle(nullptr),
         _lastFrameTimestamp(0),
         _dmxTimer(nullptr),
         _timerStartTime(0),
@@ -122,7 +156,6 @@ public:
         _dePin(dePin),
         _running(false),
         _transmitTaskHandle(nullptr),
-        _receiveTaskHandle(nullptr),
         _lastFrameTimestamp(0),
         _dmxTimer(nullptr),
         _timerStartTime(0),
@@ -138,14 +171,23 @@ public:
 
 
     ~EZDMX() {
-        stop();
+        end();
     }
 
     /**
      * @brief Initialize the UART for DMX
-     * @return true if initialization succeeds
+     *
+     * MASTER uses the IDF UART driver. SLAVE does not install it: start() takes the
+     * UART interrupt itself, so that the end of a frame and the BREAK are handled in
+     * order (see SlaveIsr).
+     *
+     * @return Result indicating success or failure
      */
     Result begin() {
+        if (_begun) {
+            return Success();
+        }
+
         // Configure the UART
         uart_config_t uart_config = {
             .baud_rate = 250000,               // DMX standard baud rate
@@ -157,54 +199,91 @@ public:
             .source_clk = UART_SCLK_DEFAULT,       // Source clock (for ESP32C6)
         };
 
+        const bool useDriver = (_mode == Mode::MASTER);
+        esp_err_t err = ESP_OK;
+
         // Install the UART driver
-        esp_err_t err = uart_driver_install(_uart_num, DMX_BUFFER_SIZE, DMX_BUFFER_SIZE, 0, NULL, ESP_INTR_FLAG_IRAM);
-        if (err != ESP_OK) {
-            return Error(UART_ERROR);
+        if (useDriver) {
+            err = uart_driver_install(_uart_num, DMX_BUFFER_SIZE, DMX_BUFFER_SIZE, 0, NULL, ESP_INTR_FLAG_IRAM);
+            if (err != ESP_OK) {
+                return Error(UART_ERROR);
+            }
         }
 
         err = uart_param_config(_uart_num, &uart_config);
         if (err != ESP_OK) {
-            uart_driver_delete(_uart_num);
+            if (useDriver) uart_driver_delete(_uart_num);
             return Error(UART_ERROR);
         }
 
         err = uart_set_pin(_uart_num, _txPin, _rxPin, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
         if (err != ESP_OK) {
-            uart_driver_delete(_uart_num);
+            if (useDriver) uart_driver_delete(_uart_num);
             return Error(GPIO_ERROR);
         }
 
-        if (_mode == Mode::MASTER) {
-            // Configure RS485 DE pin if needed
-            if (_dePin >= 0) {
-                gpio_config_t io_conf = {};
-                io_conf.intr_type = GPIO_INTR_DISABLE;
-                io_conf.mode = GPIO_MODE_OUTPUT;
-                io_conf.pin_bit_mask = (1ULL << _dePin);
-                io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
-                io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
-                
-                err = gpio_config(&io_conf);
-                if (err != ESP_OK) {
-                    uart_driver_delete(_uart_num);
-                    return Error(GPIO_ERROR);
-                }
-                
-                err = gpio_set_level((gpio_num_t)_dePin, 1);
-                if (err != ESP_OK) {
-                    uart_driver_delete(_uart_num);
-                    return Error(GPIO_ERROR);
-                }
+        // Configure RS485 DE pin if needed: driving in MASTER mode, released in SLAVE mode
+        if (_dePin >= 0) {
+            gpio_config_t io_conf = {};
+            io_conf.intr_type = GPIO_INTR_DISABLE;
+            io_conf.mode = GPIO_MODE_OUTPUT;
+            io_conf.pin_bit_mask = (1ULL << _dePin);
+            io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+            io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
+
+            err = gpio_config(&io_conf);
+            if (err == ESP_OK) {
+                err = gpio_set_level((gpio_num_t)_dePin, _mode == Mode::MASTER ? 1 : 0);
             }
-        } else {
-            // In SLAVE mode, disable the DE pin if present
-            if (_dePin >= 0) {
-                gpio_set_level((gpio_num_t)_dePin, 0);
+            if (err != ESP_OK) {
+                if (useDriver) uart_driver_delete(_uart_num);
+                return Error(GPIO_ERROR);
             }
         }
 
+        _begun = true;
         return Success();
+    }
+
+    /**
+     * @brief Stop if needed and release the UART, so that it can be used for something else
+     * @return Result indicating success or failure
+     */
+    Result end() {
+        if (_running) {
+            stop();
+        }
+        if (!_begun) {
+            return Success();
+        }
+        if (_mode == Mode::MASTER) {
+            uart_driver_delete(_uart_num);
+        }
+        if (_dePin >= 0) {
+            gpio_set_level((gpio_num_t)_dePin, 0);
+        }
+        _begun = false;
+        return Success();
+    }
+
+    /**
+     * @brief Pin the MASTER transmit task to a core (call before start())
+     *
+     * The BREAK and MAB are timed inside a critical section, which masks interrupts
+     * on that core for about 200 us. Pin it away from any time-sensitive interrupt.
+     */
+    void setTxCore(int core) {
+        _txCore = core;
+    }
+
+    /**
+     * @brief Measure BREAK, MAB and start code low time on each SLAVE frame (call before start())
+     *
+     * Costs one UART interrupt per byte and a few GPIO interrupts per frame. Edges are
+     * timestamped in an interrupt handler, so figures carry the interrupt latency jitter.
+     */
+    void enableLineTiming(bool enable) {
+        _timingEnabled = enable;
     }
 
     /**
@@ -215,22 +294,12 @@ public:
         if (_running) {
             return Success();
         }
+        if (!_begun) {
+            return Error(NOT_RUNNING);
+        }
 
-        _running = true;
         if (_mode == Mode::MASTER) {
-            // Create the transmission task
-            BaseType_t ret = xTaskCreate(TransmitTask, 
-                        "dmx_tx", 
-                        8192, 
-                        this, 
-                        5, 
-                        &_transmitTaskHandle);
-            if (ret != pdPASS) {
-                _running = false;
-                return Error(TASK_FAILED);
-            }
-            
-            // Create the esp_timer for precise DMX timing (one-shot)
+            // Create the esp_timer for precise DMX timing (one-shot) before the task that uses it
             esp_timer_create_args_t timer_args = {
                 .callback = TimerCallback,
                 .arg = this,
@@ -238,23 +307,29 @@ public:
             };
             esp_err_t errTimer = esp_timer_create(&timer_args, &_dmxTimer);
             if (errTimer != ESP_OK || _dmxTimer == nullptr) {
-                _running = false;
-                vTaskDelete(_transmitTaskHandle);
-                _transmitTaskHandle = nullptr;
+                _dmxTimer = nullptr;
                 return Error(TASK_FAILED);
             }
-            
-        } else if (_mode == Mode::SLAVE) {
-            BaseType_t ret = xTaskCreate(ReceiveTask, 
-                        "dmx_rx", 
-                        8192, 
-                        this, 
-                        5, 
-                        &_receiveTaskHandle);
+
+            _running = true;
+
+            // Create the transmission task
+            BaseType_t ret = xTaskCreatePinnedToCore(TransmitTask,
+                        "dmx_tx",
+                        8192,
+                        this,
+                        5,
+                        const_cast<TaskHandle_t*>(&_transmitTaskHandle),
+                        _txCore);
             if (ret != pdPASS) {
                 _running = false;
+                _transmitTaskHandle = nullptr;
+                esp_timer_delete(_dmxTimer);
+                _dmxTimer = nullptr;
                 return Error(TASK_FAILED);
             }
+        } else {
+            return startSlave();
         }
         return Success();
     }
@@ -271,24 +346,23 @@ public:
         _running = false;
         
         if (_mode == Mode::MASTER) {
+            // Wake the task and wait for it to exit: it may still be using the timer
+            TaskHandle_t task = _transmitTaskHandle;
+            if (task != nullptr) {
+                xTaskNotifyGive(task);
+                for (int waitedMs = 0; _transmitTaskHandle != nullptr && waitedMs < 250; waitedMs++) {
+                    vTaskDelay(pdMS_TO_TICKS(1));
+                }
+            }
+
             // Stop and delete the timer
             if (_dmxTimer != nullptr) {
                 esp_timer_stop(_dmxTimer);
                 esp_timer_delete(_dmxTimer);
                 _dmxTimer = nullptr;
             }
-            
-            // Notify the task to wake up and exit cleanly
-            if (_transmitTaskHandle != nullptr) {
-                xTaskNotifyGive(_transmitTaskHandle);
-                vTaskDelay(pdMS_TO_TICKS(50));
-                _transmitTaskHandle = nullptr;
-            }
         } else {
-            if (_receiveTaskHandle != nullptr) {
-                vTaskDelay(pdMS_TO_TICKS(50));
-                _receiveTaskHandle = nullptr;
-            }
+            stopSlave();
         }
         return Success();
     }
@@ -432,8 +506,10 @@ public:
             value = _channels[channel];
             if (timestamp) *timestamp = 0;
         } else {
+            portENTER_CRITICAL(&_dmxMux);
             value = _slaveValues[channel - 1];
             if (timestamp) *timestamp = _lastFrameTimestamp;
+            portEXIT_CRITICAL(&_dmxMux);
         }
         return Success(1); // 1 channel read
     }
@@ -454,8 +530,10 @@ public:
             memcpy(values, &_channels[1], DMX_UNIVERSE_SIZE);
             if (timestamp) *timestamp = 0;
         } else {
+            portENTER_CRITICAL(&_dmxMux);
             memcpy(values, _slaveValues, DMX_UNIVERSE_SIZE);
             if (timestamp) *timestamp = _lastFrameTimestamp;
+            portEXIT_CRITICAL(&_dmxMux);
         }
         return Success(DMX_UNIVERSE_SIZE);
     }
@@ -481,7 +559,99 @@ public:
 
     // Getter pour le timestamp de la dernière frame
     uint64_t getLastFrameTimestamp() const {
-        return _lastFrameTimestamp;
+        portENTER_CRITICAL(&_dmxMux);
+        uint64_t timestamp = _lastFrameTimestamp;
+        portEXIT_CRITICAL(&_dmxMux);
+        return timestamp;
+    }
+
+    /**
+     * @brief Wait for the next good frame and copy it (SLAVE mode only)
+     *
+     * Must not be blocked in this call while another task calls stop().
+     *
+     * @param values Pointer to array to store values (size DMX_UNIVERSE_SIZE minimum)
+     * @param timeoutMs Maximum wait
+     * @param slots Optional: slot count of the frame (values past it keep their previous content)
+     * @param sequence Optional: value of SlaveStats::frames for this frame, to detect frames skipped by the caller
+     * @return Result indicating success, TIMEOUT if no frame arrived
+     */
+    Result waitFrame(uint8_t* values, uint32_t timeoutMs, uint16_t* slots = nullptr, uint32_t* sequence = nullptr) {
+        if (_mode != Mode::SLAVE) {
+            return Error(WRONG_MODE);
+        }
+        if (values == nullptr) {
+            return Error(NULL_INPUT);
+        }
+        if (!_running || _rxFrameReady == nullptr) {
+            return Error(NOT_RUNNING);
+        }
+        if (xSemaphoreTake(_rxFrameReady, pdMS_TO_TICKS(timeoutMs)) != pdTRUE) {
+            return Error(TIMEOUT);
+        }
+        portENTER_CRITICAL(&_dmxMux);
+        memcpy(values, _slaveValues, DMX_UNIVERSE_SIZE);
+        if (slots) *slots = _stats.lastSlots;
+        if (sequence) *sequence = _stats.frames;
+        portEXIT_CRITICAL(&_dmxMux);
+        return Success(DMX_UNIVERSE_SIZE);
+    }
+
+    /**
+     * @brief Read the SLAVE reception counters
+     */
+    Result getStats(SlaveStats& stats) const {
+        if (_mode != Mode::SLAVE) {
+            return Error(WRONG_MODE);
+        }
+        uint64_t periodSum, breakSum, mabSum, startLowSum;
+        uint32_t breakMin, breakMax, mabMin, mabMax, startLowMin, startLowMax, periodSamples;
+
+        portENTER_CRITICAL(&_dmxMux);
+        stats = _stats;
+        periodSum = _periodSumUs;
+        periodSamples = _periodSamples;
+        breakSum = _breakSum;
+        breakMin = _breakMin;
+        breakMax = _breakMax;
+        mabSum = _mabSum;
+        mabMin = _mabMin;
+        mabMax = _mabMax;
+        startLowSum = _startLowSum;
+        startLowMin = _startLowMin;
+        startLowMax = _startLowMax;
+        portEXIT_CRITICAL(&_dmxMux);
+
+        if (periodSamples > 0) {
+            stats.periodAvgUs = (uint32_t)(periodSum / periodSamples);
+        }
+        if (stats.timingSamples > 0) {
+            const float ticksPerUs = (float)esp_rom_get_cpu_ticks_per_us();
+            const float samples = (float)stats.timingSamples;
+            stats.breakMinUs = breakMin / ticksPerUs;
+            stats.breakMaxUs = breakMax / ticksPerUs;
+            stats.breakAvgUs = (float)breakSum / samples / ticksPerUs;
+            stats.mabMinUs = mabMin / ticksPerUs;
+            stats.mabMaxUs = mabMax / ticksPerUs;
+            stats.mabAvgUs = (float)mabSum / samples / ticksPerUs;
+            stats.startLowMinUs = startLowMin / ticksPerUs;
+            stats.startLowMaxUs = startLowMax / ticksPerUs;
+            stats.startLowAvgUs = (float)startLowSum / samples / ticksPerUs;
+        }
+        return Success();
+    }
+
+    /**
+     * @brief Reset the SLAVE reception counters
+     */
+    Result resetStats() {
+        if (_mode != Mode::SLAVE) {
+            return Error(WRONG_MODE);
+        }
+        portENTER_CRITICAL(&_dmxMux);
+        clearStatsLocked();
+        portEXIT_CRITICAL(&_dmxMux);
+        return Success();
     }
 
 private:    
@@ -490,10 +660,11 @@ private:
     int _txPin;
     int _rxPin;
     int _dePin;
-    bool _running;
-    TaskHandle_t _transmitTaskHandle;
-    TaskHandle_t _receiveTaskHandle;
-    portMUX_TYPE _dmxMux = portMUX_INITIALIZER_UNLOCKED;
+    bool _begun = false;
+    volatile bool _running;
+    volatile TaskHandle_t _transmitTaskHandle;
+    int _txCore = tskNO_AFFINITY;
+    mutable portMUX_TYPE _dmxMux = portMUX_INITIALIZER_UNLOCKED;
 
     // esp_timer one-shot timer for DMX transmission timing
     esp_timer_handle_t _dmxTimer;
@@ -514,15 +685,52 @@ private:
     uint8_t _channels[DMX_UNIVERSE_SIZE + 1] = {0};
 
     // Storage for SLAVE mode
-    uint8_t _slaveValues[DMX_UNIVERSE_SIZE];
+    uint8_t _slaveValues[DMX_UNIVERSE_SIZE] = {0};
     uint64_t _lastFrameTimestamp;
+
+    // SLAVE reception state, owned by SlaveIsr while running
+    static constexpr int16_t RX_WAIT_BREAK = -1;   // No BREAK seen yet: bytes are not framed
+    static constexpr int16_t RX_FRAME_FULL = -2;   // 513 bytes received: waiting for the next BREAK
+    static constexpr uint32_t RX_FIFO_THRESHOLD = 32;  // Interrupt rate vs FIFO margin (128 bytes on the S3)
+    static constexpr uint32_t RX_TIMEOUT_BITS = 22;    // Drain the FIFO after about 2 idle slots
+    static constexpr uint32_t BREAK_MIN_PROBE_US = 40; // Longer than any data low time (0x00 is 36 us low)
+
+    uint8_t _rxFrame[DMX_UNIVERSE_SIZE + 1] = {0};
+    int16_t _rxHead = RX_WAIT_BREAK;
+    bool _rxBad = false;
+    bool _rxOverlong = false;
+    bool _rxFramingPending = false;
+    bool _rxFramePublished = false;
+    int16_t _rxExpectedLen = 0;
+    int64_t _rxLastBreakUs = 0;
+    intr_handle_t _rxIntr = nullptr;
+    SemaphoreHandle_t _rxFrameReady = nullptr;
+
+    SlaveStats _stats = {};
+    uint64_t _periodSumUs = 0;
+    uint32_t _periodSamples = 0;
+
+    // Line timing probe, in CPU cycles
+    bool _timingEnabled = false;
+    bool _probeHooked = false;
+    bool _probeArmed = false;
+    uint8_t _probeStage = 0;
+    uint32_t _probeFallTicks = 0;
+    uint32_t _probeBreakTicks = 0;
+    uint32_t _probeMabTicks = 0;
+    uint32_t _probeBreakMinTicks = 0;
+    uint32_t _breakMin = 0, _breakMax = 0;
+    uint32_t _mabMin = 0, _mabMax = 0;
+    uint32_t _startLowMin = 0, _startLowMax = 0;
+    uint64_t _breakSum = 0, _mabSum = 0, _startLowSum = 0;
 
     /**
      * @brief Timer callback for DMX transmission timing
      */
     static void TimerCallback(void* arg) {
         EZDMX* dmx = static_cast<EZDMX*>(arg);
-        if (dmx && dmx->_transmitTaskHandle) {
+        TaskHandle_t task = dmx ? dmx->_transmitTaskHandle : nullptr;
+        if (task) {
             // Measure timer precision
             uint64_t currentTime = esp_timer_get_time();
             if (dmx->_timerStartTime > 0) {
@@ -543,7 +751,7 @@ private:
             }
             
             // Notify the transmission task to send next frame
-            xTaskNotifyGive(dmx->_transmitTaskHandle);
+            xTaskNotifyGive(task);
         }
     }
 
@@ -561,6 +769,7 @@ private:
             if (!firstFrame) {
                 // Wait for timer notification (except for first frame)
                 ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+                if (!dmx->_running) break;
             }
             firstFrame = false;
 
@@ -622,46 +831,332 @@ private:
                 esp_timer_start_once(dmx->_dmxTimer, DMX_MTBF_MS * 1000);
             }
         }
+        dmx->_transmitTaskHandle = nullptr;
         vTaskDelete(NULL);
     }
 
-    static void ReceiveTask(void* pEZDMX) {
-        EZDMX* dmx = static_cast<EZDMX*>(pEZDMX);
-        uint8_t buffer[DMX_UNIVERSE_SIZE + 1];
-        
-        while (dmx->_running) {
-            // Attendre le BREAK
-            while (dmx->_running) {
-                uint8_t byte;
-                if (uart_read_bytes(dmx->_uart_num, &byte, 1, pdMS_TO_TICKS(100)) == 1) {
-                    if (byte == 0) {
-                        // Potentiel BREAK détecté
-                        break;
-                    }
-                }
-            }
+    Result startSlave() {
+        _rxFrameReady = xSemaphoreCreateBinary();
+        if (_rxFrameReady == nullptr) {
+            return Error(TASK_FAILED);
+        }
 
-            // Lire le paquet DMX complet
-            size_t length = uart_read_bytes(dmx->_uart_num, buffer, DMX_UNIVERSE_SIZE + 1, pdMS_TO_TICKS(100));
-            
-            if (length == DMX_UNIVERSE_SIZE + 1 && buffer[0] == 0) {
-                uint64_t now = esp_timer_get_time() / 1000;
-                
-                portENTER_CRITICAL(&dmx->_dmxMux);
-                // Mettre à jour le timestamp
-                dmx->_lastFrameTimestamp = now;
-                
-                // Mettre à jour les canaux
-                for (size_t i = 0; i < DMX_UNIVERSE_SIZE; i++) {
-                    if (dmx->_slaveValues[i] != buffer[i + 1]) {
-                        dmx->_slaveValues[i] = buffer[i + 1];
-                    }
-                }
-                portEXIT_CRITICAL(&dmx->_dmxMux);
+        uart_dev_t* hw = UART_LL_GET_HW(_uart_num);
+        uart_ll_disable_intr_mask(hw, UART_LL_INTR_MASK);
+        uart_ll_clr_intsts_mask(hw, UART_LL_INTR_MASK);
+        uart_ll_rxfifo_rst(hw);
+        // The probe arms itself on the last bytes of a frame, so it needs them one by one
+        uart_ll_set_rxfifo_full_thr(hw, _timingEnabled ? 1 : RX_FIFO_THRESHOLD);
+        uart_ll_set_rx_tout(hw, RX_TIMEOUT_BITS);
+
+        portENTER_CRITICAL(&_dmxMux);
+        clearStatsLocked();
+        _rxHead = RX_WAIT_BREAK;
+        _rxBad = false;
+        _rxOverlong = false;
+        _rxFramingPending = false;
+        _rxFramePublished = false;
+        _rxExpectedLen = 0;
+        _rxLastBreakUs = 0;
+        _probeArmed = false;
+        _probeStage = 0;
+        portEXIT_CRITICAL(&_dmxMux);
+
+        if (_timingEnabled) {
+            Result probe = hookProbe();
+            if (probe != SUCCESS) {
+                vSemaphoreDelete(_rxFrameReady);
+                _rxFrameReady = nullptr;
+                return probe;
             }
         }
-        
-        vTaskDelete(NULL);
+
+        _running = true;
+        esp_err_t err = esp_intr_alloc(uart_periph_signal[_uart_num].irq, 0, SlaveIsr, this, &_rxIntr);
+        if (err != ESP_OK) {
+            _running = false;
+            unhookProbe();
+            vSemaphoreDelete(_rxFrameReady);
+            _rxFrameReady = nullptr;
+            return Error(UART_ERROR);
+        }
+        uart_ll_ena_intr_mask(hw, UART_INTR_RXFIFO_FULL | UART_INTR_RXFIFO_TOUT | UART_INTR_RXFIFO_OVF |
+                                  UART_INTR_BRK_DET | UART_INTR_FRAM_ERR);
+        return Success();
+    }
+
+    void stopSlave() {
+        uart_dev_t* hw = UART_LL_GET_HW(_uart_num);
+        uart_ll_disable_intr_mask(hw, UART_LL_INTR_MASK);
+        if (_rxIntr != nullptr) {
+            esp_intr_free(_rxIntr);
+            _rxIntr = nullptr;
+        }
+        uart_ll_clr_intsts_mask(hw, UART_LL_INTR_MASK);
+        unhookProbe();
+        if (_rxFrameReady != nullptr) {
+            vSemaphoreDelete(_rxFrameReady);
+            _rxFrameReady = nullptr;
+        }
+    }
+
+    Result hookProbe() {
+        if (_rxPin < 0) {
+            return Error(GPIO_ERROR);
+        }
+        _probeBreakMinTicks = BREAK_MIN_PROBE_US * esp_rom_get_cpu_ticks_per_us();
+        esp_err_t err = gpio_install_isr_service(0);
+        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {  // Already installed is fine
+            return Error(GPIO_ERROR);
+        }
+        gpio_intr_disable((gpio_num_t)_rxPin);
+        gpio_set_intr_type((gpio_num_t)_rxPin, GPIO_INTR_ANYEDGE);
+        err = gpio_isr_handler_add((gpio_num_t)_rxPin, ProbeIsr, this);
+        if (err != ESP_OK) {
+            gpio_set_intr_type((gpio_num_t)_rxPin, GPIO_INTR_DISABLE);
+            return Error(GPIO_ERROR);
+        }
+        _probeHooked = true;
+        return Success();
+    }
+
+    void unhookProbe() {
+        if (!_probeHooked) {
+            return;
+        }
+        gpio_intr_disable((gpio_num_t)_rxPin);
+        gpio_isr_handler_remove((gpio_num_t)_rxPin);
+        gpio_set_intr_type((gpio_num_t)_rxPin, GPIO_INTR_DISABLE);
+        _probeHooked = false;
+    }
+
+    void clearStatsLocked() {
+        _stats = {};
+        _periodSumUs = 0;
+        _periodSamples = 0;
+        _breakMin = _breakMax = 0;
+        _mabMin = _mabMax = 0;
+        _startLowMin = _startLowMax = 0;
+        _breakSum = _mabSum = _startLowSum = 0;
+    }
+
+    /**
+     * @brief SLAVE reception, framed on the hardware BREAK detection
+     *
+     * Runs instead of the IDF UART driver. With the driver, a BREAK event overtakes the
+     * bytes still in the hardware FIFO, so with frames sent back to back the end of a
+     * frame and the start of the next cannot be told apart. Here the FIFO is read when
+     * the BREAK is handled: what it holds belongs to the frame that just ended, except
+     * for its last byte, the 0x00 the BREAK itself produces.
+     *
+     * A value of 0x00 in the data is never mistaken for a BREAK.
+     */
+    static void SlaveIsr(void* arg) {
+        EZDMX* dmx = static_cast<EZDMX*>(arg);
+        uart_dev_t* hw = UART_LL_GET_HW(dmx->_uart_num);
+        bool frameReady = false;
+
+        portENTER_CRITICAL_ISR(&dmx->_dmxMux);
+        uint32_t status;
+        while ((status = uart_ll_get_intsts_mask(hw)) != 0) {
+            uint32_t pending = uart_ll_get_rxfifo_len(hw);
+
+            if (status & UART_INTR_RXFIFO_OVF) {
+                uart_ll_rxfifo_rst(hw);
+                pending = 0;
+                dmx->_stats.fifoOverflows++;
+                dmx->_rxBad = true;
+            }
+
+            if (status & UART_INTR_BRK_DET) {
+                if (pending > 0) {
+                    dmx->drainFifo(hw, pending - 1);  // The last byte is the BREAK's own 0x00
+                }
+                uart_ll_rxfifo_rst(hw);
+                dmx->finishFrame();
+                dmx->startFrame();
+            } else {
+                // A framing error only counts once the line has carried on with more data:
+                // the BREAK raises one too, and it may be reported first
+                if (dmx->_rxFramingPending && pending > 0) {
+                    dmx->_rxFramingPending = false;
+                    dmx->_stats.framingErrors++;
+                    dmx->_rxBad = true;
+                }
+                if (status & UART_INTR_FRAM_ERR) {
+                    dmx->_rxFramingPending = true;
+                }
+                dmx->drainFifo(hw, pending);
+            }
+
+            // Cleared last: the FIFO interrupts stay raised until the FIFO has been read
+            uart_ll_clr_intsts_mask(hw, status);
+        }
+        frameReady = dmx->_rxFramePublished;
+        dmx->_rxFramePublished = false;
+        portEXIT_CRITICAL_ISR(&dmx->_dmxMux);
+
+        if (frameReady) {
+            BaseType_t woken = pdFALSE;
+            xSemaphoreGiveFromISR(dmx->_rxFrameReady, &woken);
+            if (woken == pdTRUE) {
+                portYIELD_FROM_ISR();
+            }
+        }
+    }
+
+    void drainFifo(uart_dev_t* hw, uint32_t count) {
+        while (count-- > 0) {
+            uint8_t byte;
+            uart_ll_read_rxfifo(hw, &byte, 1);
+
+            if (_rxHead == RX_FRAME_FULL) {
+                _rxOverlong = true;
+            }
+            if (_rxHead < 0) {
+                continue;
+            }
+            _rxFrame[_rxHead++] = byte;
+
+            // The GPIO probe has to be listening before the next BREAK falls. Armed one slot
+            // early since the last stop bits leave only a few microseconds. It skips data edges.
+            if (_timingEnabled && !_probeArmed && _rxExpectedLen > 1 && _rxHead == _rxExpectedLen - 1) {
+                _probeArmed = true;
+                _probeStage = 0;
+                gpio_intr_enable((gpio_num_t)_rxPin);
+            }
+
+            if (_rxHead == (int16_t)(DMX_UNIVERSE_SIZE + 1)) {
+                publishFrame(_rxHead);
+                _rxHead = RX_FRAME_FULL;
+            }
+        }
+    }
+
+    // Called on a BREAK: a frame shorter than the universe ends here
+    void finishFrame() {
+        if (_rxHead == 0) {
+            _stats.emptyFrames++;
+        } else if (_rxHead > 0) {
+            publishFrame(_rxHead);
+        }
+        if (_rxOverlong) {
+            _stats.overlongFrames++;
+        }
+    }
+
+    void publishFrame(int16_t length) {
+        _rxExpectedLen = length;
+        if (_rxBad) {
+            _stats.errorFrames++;
+            return;
+        }
+        if (_rxFrame[0] != 0) {
+            _stats.startCodeFrames++;
+            return;
+        }
+
+        const uint16_t slots = length - 1;
+        memcpy(_slaveValues, &_rxFrame[1], slots);
+        _lastFrameTimestamp = esp_timer_get_time() / 1000;
+        _stats.frames++;
+        _stats.lastSlots = slots;
+        if (slots < DMX_UNIVERSE_SIZE) {
+            _stats.shortFrames++;
+        }
+        if (_stats.frames == 1 || slots < _stats.minSlots) _stats.minSlots = slots;
+        if (slots > _stats.maxSlots) _stats.maxSlots = slots;
+        _rxFramePublished = true;
+    }
+
+    void startFrame() {
+        const int64_t now = esp_timer_get_time();
+        _stats.breaks++;
+        if (_rxLastBreakUs != 0) {
+            const uint32_t period = (uint32_t)(now - _rxLastBreakUs);
+            if (_periodSamples == 0 || period < _stats.periodMinUs) _stats.periodMinUs = period;
+            if (period > _stats.periodMaxUs) _stats.periodMaxUs = period;
+            _periodSumUs += period;
+            _periodSamples++;
+        }
+        _rxLastBreakUs = now;
+
+        _rxHead = 0;
+        _rxBad = false;
+        _rxOverlong = false;
+        _rxFramingPending = false;
+
+        // The BREAK has been low for one character by now: the probe must have seen it fall
+        if (_probeArmed && _probeStage == 0) {
+            gpio_intr_disable((gpio_num_t)_rxPin);
+            _probeArmed = false;
+            _stats.timingMissed++;
+        }
+    }
+
+    /**
+     * @brief Line timing probe: BREAK fall, BREAK rise, start code fall, start code rise
+     *
+     * Enabled by SlaveIsr only around the BREAK, then disabled, so that the data of a busy
+     * universe does not load the CPU. Reads the level instead of trusting the edge order, and
+     * ignores any low time too short to be a BREAK.
+     */
+    static void ProbeIsr(void* arg) {
+        EZDMX* dmx = static_cast<EZDMX*>(arg);
+        const uint32_t now = esp_cpu_get_cycle_count();
+        const int level = gpio_get_level((gpio_num_t)dmx->_rxPin);
+
+        portENTER_CRITICAL_ISR(&dmx->_dmxMux);
+        switch (dmx->_probeStage) {
+            case 0:  // Waiting for the BREAK to fall
+                if (level == 0) {
+                    dmx->_probeFallTicks = now;
+                    dmx->_probeStage = 1;
+                }
+                break;
+            case 1:  // Waiting for the BREAK to rise
+                if (level == 1) {
+                    const uint32_t low = now - dmx->_probeFallTicks;
+                    if (low < dmx->_probeBreakMinTicks) {
+                        dmx->_probeStage = 0;  // Still in the data
+                    } else {
+                        dmx->_probeBreakTicks = low;
+                        dmx->_probeFallTicks = now;
+                        dmx->_probeStage = 2;
+                    }
+                }
+                break;
+            case 2:  // Waiting for the end of the MAB
+                if (level == 0) {
+                    dmx->_probeMabTicks = now - dmx->_probeFallTicks;
+                    dmx->_probeFallTicks = now;
+                    dmx->_probeStage = 3;
+                }
+                break;
+            case 3:  // Waiting for the end of the start code low time
+                if (level == 1) {
+                    dmx->recordTiming(dmx->_probeBreakTicks, dmx->_probeMabTicks, now - dmx->_probeFallTicks);
+                    gpio_intr_disable((gpio_num_t)dmx->_rxPin);
+                    dmx->_probeArmed = false;
+                    dmx->_probeStage = 0;
+                }
+                break;
+        }
+        portEXIT_CRITICAL_ISR(&dmx->_dmxMux);
+    }
+
+    void recordTiming(uint32_t breakTicks, uint32_t mabTicks, uint32_t startLowTicks) {
+        const bool first = (_stats.timingSamples == 0);
+        if (first || breakTicks < _breakMin) _breakMin = breakTicks;
+        if (breakTicks > _breakMax) _breakMax = breakTicks;
+        if (first || mabTicks < _mabMin) _mabMin = mabTicks;
+        if (mabTicks > _mabMax) _mabMax = mabTicks;
+        if (first || startLowTicks < _startLowMin) _startLowMin = startLowTicks;
+        if (startLowTicks > _startLowMax) _startLowMax = startLowTicks;
+        _breakSum += breakTicks;
+        _mabSum += mabTicks;
+        _startLowSum += startLowTicks;
+        _stats.timingSamples++;
     }
 
 #ifdef ARDUINO
