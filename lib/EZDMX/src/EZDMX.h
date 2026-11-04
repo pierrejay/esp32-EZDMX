@@ -76,6 +76,7 @@ public:
     static constexpr uint32_t DMX_BREAK_US = 180;   // Break (min 92µs)
     static constexpr uint32_t DMX_MAB_US = 24;      // Mark After Break (min 12µs)
     static constexpr uint32_t DMX_MTBF_MS = 10;     // Mark Time Between Frames (spec says 0-1000 ms)
+    static constexpr int64_t DMX_FRAME_AIR_US = (DMX_UNIVERSE_SIZE + 1) * 44;  // 11 bits per slot at 250 kbaud
 
     /**
      * @brief SLAVE reception counters, cumulative since start() or resetStats()
@@ -788,10 +789,15 @@ private:
             portEXIT_CRITICAL(&dmx->_dmxMux);
             
             // 3. Send the DMX packet
+            const int64_t writeStart = esp_timer_get_time();
             uart_write_bytes(dmx->_uart_num, (const char*)dmx->_channels, DMX_UNIVERSE_SIZE + 1);
             
-            // 4. Wait for all data to be sent
+            // 4. Wait for all data to be sent. uart_wait_tx_done alone is not enough: it can return
+            // early on the first frame, and the next BREAK would then invert the line mid-frame.
             uart_wait_tx_done(dmx->_uart_num, pdMS_TO_TICKS(100));
+            while (esp_timer_get_time() - writeStart < DMX_FRAME_AIR_US) {
+                vTaskDelay(1);
+            }
             
             // === Frame-to-frame performance measurement ===
             uint64_t nowFrameTime = esp_timer_get_time();
