@@ -103,6 +103,8 @@ public:
         uint32_t periodMaxUs;
         uint32_t timingSamples;   // Frames measured by the line timing probe
         uint32_t timingMissed;    // Frames whose BREAK falling edge the probe did not catch
+        uint32_t breakShort;      // Samples with BREAK under 88 us (E1.11 receiver minimum)
+        uint32_t mabShort;        // Samples with MAB under 8 us (E1.11 receiver minimum)
         float breakMinUs, breakAvgUs, breakMaxUs;
         float mabMinUs, mabAvgUs, mabMaxUs;
         float startLowMinUs, startLowAvgUs, startLowMaxUs; // Low time of a 0x00 start code: 36 us at 250 kbaud
@@ -911,9 +913,15 @@ private:
             return Error(GPIO_ERROR);
         }
         _probeBreakMinTicks = BREAK_MIN_PROBE_US * esp_rom_get_cpu_ticks_per_us();
-        esp_err_t err = gpio_install_isr_service(0);
-        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {  // Already installed is fine
-            return Error(GPIO_ERROR);
+        // Installed once and kept: the service may be shared, and installing twice logs an error
+        static bool isrServiceInstalled = false;
+        esp_err_t err = ESP_OK;
+        if (!isrServiceInstalled) {
+            err = gpio_install_isr_service(0);
+            if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+                return Error(GPIO_ERROR);
+            }
+            isrServiceInstalled = true;
         }
         gpio_intr_disable((gpio_num_t)_rxPin);
         gpio_set_intr_type((gpio_num_t)_rxPin, GPIO_INTR_ANYEDGE);
@@ -986,8 +994,11 @@ private:
                 // the BREAK raises one too, and it may be reported first
                 if (dmx->_rxFramingPending && pending > 0) {
                     dmx->_rxFramingPending = false;
-                    dmx->_stats.framingErrors++;
-                    dmx->_rxBad = true;
+                    // Starting in the middle of a frame misreads bytes: not an error until framed
+                    if (dmx->_rxHead != RX_WAIT_BREAK) {
+                        dmx->_stats.framingErrors++;
+                        dmx->_rxBad = true;
+                    }
                 }
                 if (status & UART_INTR_FRAM_ERR) {
                     dmx->_rxFramingPending = true;
@@ -1153,6 +1164,9 @@ private:
 
     void recordTiming(uint32_t breakTicks, uint32_t mabTicks, uint32_t startLowTicks) {
         const bool first = (_stats.timingSamples == 0);
+        const uint32_t ticksPerUs = esp_rom_get_cpu_ticks_per_us();
+        if (breakTicks < 88 * ticksPerUs) _stats.breakShort++;
+        if (mabTicks < 8 * ticksPerUs) _stats.mabShort++;
         if (first || breakTicks < _breakMin) _breakMin = breakTicks;
         if (breakTicks > _breakMax) _breakMax = breakTicks;
         if (first || mabTicks < _mabMin) _mabMin = mabTicks;
