@@ -2,7 +2,7 @@
 
 ## Overview
 
-`EZDMX` is a simple & lightweight library for controlling and receiving DMX512 signals on ESP32 platforms. It supports both Arduino ESP32 Core and native ESP-IDF environments. It uses FreeRTOS tasks to handle DMX operations asynchronously, allowing main application code to run without blocking while DMX communication occurs in the background.
+`EZDMX` is a simple & lightweight library for controlling and receiving DMX512 signals on ESP32 platforms. It supports both Arduino ESP32 Core and native ESP-IDF environments. DMX runs in the background, so the main application code never blocks: a FreeRTOS task transmits in `MASTER` mode, and a dedicated UART interrupt receives in `SLAVE` mode.
 
 ## Operating Modes
 
@@ -10,7 +10,7 @@
 
 - **`MASTER` Mode**: The ESP32 functions as a DMX controller, sending DMX data for the 512 channels to connected fixtures. The library manages the DMX protocol timing requirements including proper break timing and frame structure.
 
-- **`SLAVE` Mode**: The ESP32 functions as a DMX receiver, processing incoming DMX signals to read the DMX values of the 512 channels. This mode enables debugging or building custom DMX-controlled devices.
+- **`SLAVE` Mode**: The ESP32 functions as a DMX receiver, processing incoming DMX signals to read the DMX values of the 512 channels. This mode enables debugging or building custom DMX-controlled devices. Frames are delimited by the BREAK the UART hardware detects, so a channel at 0 is never taken for a BREAK. A frame with a framing error or a FIFO overflow is dropped, and the last good values stay in place.
 
 
 ## Key Features
@@ -18,7 +18,8 @@
 - Simple API for DMX control and monitoring
 - Compliant with DMX512 timing specifications (UART API + esp_timer for MTBF)
 - Support for both `MASTER` (transmission) and `SLAVE` (reception) modes
-- Asynchronous operation using FreeRTOS tasks
+- Asynchronous operation: FreeRTOS task for `MASTER`, UART interrupt for `SLAVE`
+- `SLAVE` reception counters, and optional measurement of BREAK, MAB and frame period
 - Efficient error handling with Result system
 - Works with all ESP32 family chips
 
@@ -146,7 +147,27 @@ dmx.get(1, value, &timestamp);  // Get value and last update timestamp
 // Read all channels
 uint8_t values[EZDMX::DMX_UNIVERSE_SIZE];
 dmx.getAllChannels(values, &timestamp);
+
+// In SLAVE mode - wait for the next good frame (here up to 100 ms)
+uint16_t slots;
+if (dmx.waitFrame(values, 100, &slots) == EZDMX::SUCCESS) {
+  // values holds the frame, slots its channel count
+}
 ```
+
+### Reception Counters (SLAVE mode)
+
+```cpp
+dmx.enableLineTiming(true);  // Optional, before start(): measure BREAK, MAB and start code low time
+dmx.begin();
+dmx.start();
+
+EZDMX::SlaveStats stats;
+dmx.getStats(stats);  // frames, errorFrames, framingErrors, breakAvgUs, mabMinUs, periodAvgUs...
+dmx.resetStats();
+```
+
+Line timing costs one UART interrupt per byte. Edges are timestamped in an interrupt handler, so each reading carries a few microseconds of jitter, and another interrupt can delay one sample by tens of microseconds.
 
 ### Resetting All Channels
 
@@ -221,6 +242,7 @@ Parameters list:
 | `Result begin()` | Initialize DMX hardware |
 | `Result start()` | Start DMX transmission/reception |
 | `Result stop()` | Stop DMX transmission/reception |
+| `Result end()` | Stop if needed and release the UART and the DE pin |
 | `Result set(uint16_t channel, uint8_t value)` | Set value for a single channel (1-512) |
 | `Result set(const std::map<uint16_t, uint8_t>& channelValues)` | Set values from map |
 | `Result set(const std::unordered_map<uint16_t, uint8_t>& channelValues)` | Set values from unordered map |
@@ -231,11 +253,16 @@ Parameters list:
 | `Result resetAllChannels()` | Set all channels to 0 (`MASTER` only) |
 | `bool isRunning()` | Check if DMX is active |
 | `uint64_t getLastFrameTimestamp()` | Get timestamp of last received frame (`SLAVE` only) |
+| `Result waitFrame(uint8_t* values, uint32_t timeoutMs, uint16_t* slots = nullptr, uint32_t* sequence = nullptr)` | Wait for the next good frame and copy it (`SLAVE` only) |
+| `Result getStats(SlaveStats& stats)` | Read reception counters and line timing (`SLAVE` only) |
+| `Result resetStats()` | Reset reception counters (`SLAVE` only) |
+| `void enableLineTiming(bool enable)` | Measure BREAK, MAB and start code low time, call before `start()` (`SLAVE` only) |
+| `void setTxCore(int core)` | Pin the transmit task to a core, call before `start()` (`MASTER` only) |
 
 ### Constants
 
 - `DMX_UNIVERSE_SIZE`: 512 (number of channels in a DMX universe)
-- `DMX_BUFFER_SIZE`: 1024 (internal buffer size)
+- `DMX_BUFFER_SIZE`: 1024 (UART driver buffer size, `MASTER` only)
 - DMX timing constants: `DMX_BREAK_US`, `DMX_MAB_US`, `DMX_MTBF_MS` (see [Timings](#timings) section)
 
 ### Compatibility
@@ -243,6 +270,8 @@ Parameters list:
 Tested & stable with:
 - Arduino ESP32 Core 3.0.7: [pioarduino](https://github.com/pioarduino/platform-espressif32)
 - ESP-IDF v5.1
+
+The `SLAVE` interrupt reception was validated on ESP32-S3 with Arduino ESP32 Core 3.3 (ESP-IDF 5.5), receiving an RK3506 DMX engine through CA-IS2092A and TD301M485 transceivers. It builds for ESP32-C6 but was not run there.
 
 
 ## Wiring Example
